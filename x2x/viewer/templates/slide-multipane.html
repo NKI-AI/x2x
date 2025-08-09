@@ -1,0 +1,836 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Model Output Viewer</title>
+<meta name="viewport" content="user-scalable=no">
+
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+<div id="images">
+    <h1>Model Output Viewer</h1>
+    <div class="current-slide">
+        <p class="load-slide" data-mpp="{{ slide_mpp }}">Current slide: <span id="current-slide-name"></span></p>
+    </div>
+
+    <div>
+        <h2 style="margin: 0;">Image overlay type</h2>
+        <p style="margin: 4px 0;">
+            Select on-hover image to show when hovering on an inferred patch.
+            <span class="info-tooltip">
+                i
+                <span class="tooltip-text">
+                    This is the image that shows when hovering over a tile that the user has run inference on. GradCAM
+                    (...) Logit shows the GradCAM image that shows which parts of the image led the model to output a
+                    high score. This is most sensible if the output is actually high (positive logit). GradCAM (...)
+                    Inverse Logit, instead, shows the parts of the image that
+                    led the model to output a low score. This is most sensible if the output is actually low (negative
+                    logit). Macenko Normalization shows the normalized image that is actually passed to the model.
+                </span>
+            </span>
+        </p>
+    </div>
+    <div id="previewType" class="radio-group" style="margin-top: 10px;">
+        <div class="radio-slider-indicator"></div>
+        <label class="radio-label" for="preview-1">
+            <input type="radio" id="preview-1" name="previewType" value="score_positive" checked>
+            <span class="radio-number">1</span>
+            <span class="radio-text">GradCAM: Output Logit</span>
+        </label>
+        <label class="radio-label" for="preview-2">
+            <input type="radio" id="preview-2" name="previewType" value="score_negative">
+            <span class="radio-number">2</span>
+            <span class="radio-text">GradCAM: Inverse Output Logit</span>
+        </label>
+        <label class="radio-label" for="preview-3">
+            <input type="radio" id="preview-3" name="previewType" value="attention_positive">
+            <span class="radio-number">3</span>
+            <span class="radio-text">GradCAM: Attention Logit</span>
+        </label>
+        <label class="radio-label" for="preview-4">
+            <input type="radio" id="preview-4" name="previewType" value="attention_negative">
+            <span class="radio-number">4</span>
+            <span class="radio-text">GradCAM: Inverse Attention Logit</span>
+        </label>
+        <label class="radio-label" for="preview-5">
+            <input type="radio" id="preview-5" name="previewType" value="attention_times_score">
+            <span class="radio-number">5</span>
+            <span class="radio-text">GradCAM: Attention × Score</span>
+        </label>
+        <label class="radio-label" for="preview-6">
+            <input type="radio" id="preview-6" name="previewType" value="macenko">
+            <span class="radio-number">6</span>
+            <span class="radio-text">Macenko Normalization</span>
+        </label>
+    </div>
+</div>
+
+
+<div id="view">
+</div>
+
+
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="{{ url_for('static', filename='openseadragon.js') }}"></script>
+<script src="{{ url_for('static', filename='openseadragon-scalebar.js') }}"></script>
+
+
+<script type="text/javascript">
+
+    // I would prefer to move this to a separate js file, but the weird jinja templating doesn't nicely allow this
+
+    $(function () {
+        var dzi_data = {{ dzi_data|default ('{}') | safe
+    }};
+
+    const slideUrl = "{{ slide_url }}";
+    document.getElementById('current-slide-name').textContent = slideUrl.split('/').pop();
+
+    window.slide_mpp = parseFloat('{{ slide_mpp }}');
+    window.TARGET_MPP = {{ config.TARGET_MPP }};
+    window.TILE_SIZE = {{ config.TILE_SIZE }};
+
+    var viewer = new OpenSeadragon({
+        id: "view",
+        prefixUrl: "{{ url_for('static', filename='images/') }}",
+        timeout: 120000,
+        animationTime: 0.5,
+        blendTime: 0.1,
+        constrainDuringPan: true,
+        maxZoomPixelRatio: 2,
+        minZoomImageRatio: 1,
+        visibilityRatio: 1,
+        zoomPerScroll: 2,
+        showNavigator: true,
+        navigatorPosition: 'BOTTOM_RIGHT'
+    });
+
+    // Add near the top of the script, after viewer initialization
+    let targetToRawMultiplication = null;
+
+    function initializeScaleFactor() {
+        const actualMPP = window.slide_mpp || window.TARGET_MPP;
+        const targetMPP = window.TARGET_MPP;
+        targetToRawMultiplication = targetMPP / actualMPP; // THIS IS REALLY CORRECT DONT CHANGE ME
+        console.log(`Initialized scale factor: ${targetToRawMultiplication} (${targetMPP} / ${actualMPP})`);
+    }
+
+    /**
+     * Converts coordinates from raw image space to 0.5 MPP space
+     * 
+     * @param {Object} imagePoint - Point in raw image coordinates (from OpenSeadragon)
+     * @param {number} imagePoint.x - X coordinate in raw image space
+     * @param {number} imagePoint.y - Y coordinate in raw image space
+     * 
+     * @returns {Object} Converted coordinates
+     * @returns {number} .x - X coordinate at 0.5 MPP
+     * @returns {number} .y - Y coordinate at 0.5 MPP
+     * @returns {Object} .raw - Original raw image coordinates
+     * @returns {Object} .topLeft - Top-left coordinates at 0.5 MPP (for 224x224 patch)
+     * 
+     * Example:
+     * If raw image is at 0.25 MPP (higher resolution):
+     * - targetToRawMultiplication = targetMPP/actualMPP = 0.5/0.25 = 2
+     * - Input (100,100) in raw space becomes (50,50) at 0.5 MPP
+     * - topLeft will be (-62,-62) at 0.5 MPP (50-112, 50-112)
+     * 
+     * Higher MPP = lower resolution = fewer pixels per micron
+     */
+    function convertCoordinates(imagePoint) {
+        // Convert from raw to 0.5mpp
+        if (targetToRawMultiplication === null) {
+            console.error('Scale factor not initialized!');
+            return null;
+        }
+
+        // Convert from raw image coordinates to 0.5 MPP coordinates
+        const target_x = Math.floor(imagePoint.x / targetToRawMultiplication);  // DIVIDE by scale factor
+        const target_y = Math.floor(imagePoint.y / targetToRawMultiplication);
+
+        return {
+            x: target_x,
+            y: target_y,
+            raw: imagePoint,
+            topLeft: {
+                x: target_x - (window.TILE_SIZE / 2),  // 112 is half of 224 at 0.5 MPP
+                y: target_y - (window.TILE_SIZE / 2)
+            }
+        };
+    }
+
+    // Create coordinate display element with unified styling
+    let coordElement = document.createElement('div');
+    coordElement.className = 'viewer-tooltip';
+    coordElement.style.position = 'absolute';
+    coordElement.style.bottom = '10px';
+    coordElement.style.left = '10px';
+    coordElement.style.zIndex = '1000';
+    coordElement.textContent = 'Initializing...';
+    viewer.container.appendChild(coordElement);
+
+    // Set up scalebar after viewer initialization
+    viewer.scalebar({
+        xOffset: 10,
+        yOffset: 10,
+        barThickness: 3,
+        color: '#555555',
+        fontColor: '#333333',
+        backgroundColor: 'rgba(255, 255, 255, 0.5)',
+    });
+
+    // Wait for the viewer to be ready before setting up mouse tracking
+    viewer.addHandler('open', function () {
+        console.log('Viewer open event fired');
+        initializeScaleFactor();
+
+        // Helper function to create overlays
+        function createOverlay(styles) {
+            const overlay = document.createElement('div');
+            overlay.style.position = 'absolute';
+            overlay.style.pointerEvents = 'none';
+            overlay.style.boxSizing = 'border-box';
+            overlay.style.webkitBoxSizing = 'border-box';
+            overlay.style.mozBoxSizing = 'border-box';
+            Object.assign(overlay.style, styles);
+            viewer.element.appendChild(overlay);
+            return overlay;
+        }
+
+
+        function createPreviewBoxWithImage(snapshotSquare, responseData, imagePath) {
+            // Used for all overlaying images on-hover on a patch that we ran inference for
+            const previewBox = createCaptureBox('rgba(255, 0, 0, 0.8)', 'rgba(0, 0, 0, 0.1)');
+            previewBox.style.display = 'none';
+            previewBox.style.pointerEvents = 'none';  // Ignore mouse events
+
+            // Add animation handler for continuous updates during zoom/pan
+            viewer.addHandler('animation', function () {
+                if (previewBox.style.display === 'block') {  // Only update if visible
+                    const snapshotPoint = capturePoints.get(snapshotSquare.id);
+                    if (snapshotPoint) {
+                        updateSavedSquarePosition(previewBox, snapshotPoint);
+                    }
+                }
+            });
+
+            // Position preview box at the same coordinates as snapshot square
+            const updatePosition = () => {
+                previewBox.style.left = snapshotSquare.style.left;
+                previewBox.style.top = snapshotSquare.style.top;
+                previewBox.style.width = snapshotSquare.style.width;
+                previewBox.style.height = snapshotSquare.style.height;
+            };
+            updatePosition();
+
+            // Update position when viewport changes
+            viewer.addHandler('update-viewport', updatePosition);
+
+            // Create image element for preview
+            const previewImage = document.createElement('img');
+            previewImage.style.position = 'absolute';
+            // Compensate for 2px border: make image larger and offset by border width
+            previewImage.style.width = 'calc(100% + 4px)';
+            previewImage.style.height = 'calc(100% + 4px)';
+            previewImage.style.objectFit = 'cover';
+            previewImage.style.left = '-2px';
+            previewImage.style.top = '-2px';
+            previewImage.style.margin = '0';
+            previewImage.style.padding = '0';
+
+            // Set the image source only if gradcam images are available
+            if (responseData.images && Object.keys(responseData.images).length > 0) {
+                previewImage.src = `${responseData.save_path}/${imagePath}`;
+                previewBox.appendChild(previewImage);
+            }
+
+            // Make sure preview image also ignores mouse events
+            previewImage.style.pointerEvents = 'none';
+
+
+            return previewBox;
+        }
+
+        // Create overlays
+        const boxOverlay = createOverlay({
+            border: '2px solid yellow',
+            outline: '1px solid rgba(0,0,0,0.8)',
+            boxSizing: 'border-box',
+            pointerEvents: 'none'
+        });
+
+        // Create three separate coordinate boxes with nice styling
+        const coordContainer = createOverlay({
+            pointerEvents: 'none',
+            display: 'flex',
+            gap: '8px',
+            left: '50%',
+            top: '10px',
+            transform: 'translateX(-50%)',
+            zIndex: '2000'
+        });
+
+        const xCoordBox = document.createElement('div');
+        xCoordBox.className = 'coord-box coord-x';
+        xCoordBox.innerHTML = '<span class="coord-icon">📍</span><span class="coord-label">X:</span><span class="coord-value">---</span>';
+
+        const yCoordBox = document.createElement('div');
+        yCoordBox.className = 'coord-box coord-y';
+        yCoordBox.innerHTML = '<span class="coord-icon">📍</span><span class="coord-label">Y:</span><span class="coord-value">---</span>';
+
+        const mppBox = document.createElement('div');
+        mppBox.className = 'coord-box coord-mpp';
+        mppBox.innerHTML = '<span class="coord-icon">🔍</span><span class="coord-label">MPP:</span><span class="coord-value">---</span>';
+
+        coordContainer.appendChild(xCoordBox);
+        coordContainer.appendChild(yCoordBox);
+        coordContainer.appendChild(mppBox);
+
+        // Store current coordinates globally
+        let currentImagePoint = null;
+
+        // Store all capture points
+        const capturePoints = new Map();
+
+        // // MPP calculations (shared between mouse tracking and key handler)
+        // const actualMPP = window.slide_mpp || 0.5;
+        // const targetMPP = 0.5;
+        // const scaleFactor = actualMPP / targetMPP;
+
+        // Helper function to position overlays
+        function positionSquare(imagePoint, targetOverlay) {
+            // Convert click point to viewport coordinates
+            const viewportPoint = viewer.viewport.imageToViewportCoordinates(imagePoint);
+
+            // Calculate box size in raw image coordinates (224 at 0.5 MPP -> raw image space)
+            const rawBoxSize = window.TILE_SIZE * targetToRawMultiplication;
+            const boxSizeImage = { x: rawBoxSize, y: rawBoxSize };
+
+            // Get viewport rectangle for the box
+            const boxSizeViewport = viewer.viewport.imageToViewportRectangle(
+                imagePoint.x,
+                imagePoint.y,
+                boxSizeImage.x,
+                boxSizeImage.y
+            );
+
+            // Calculate screen coordinates for the box corners
+            const topLeftPixel = viewer.viewport.viewportToViewerElementCoordinates(
+                new OpenSeadragon.Point(
+                    viewportPoint.x - (boxSizeViewport.width / 2),  // Center horizontally
+                    viewportPoint.y - (boxSizeViewport.height / 2)  // Center vertically
+                )
+            );
+
+            const bottomRightPixel = viewer.viewport.viewportToViewerElementCoordinates(
+                new OpenSeadragon.Point(
+                    viewportPoint.x + (boxSizeViewport.width / 2),
+                    viewportPoint.y + (boxSizeViewport.height / 2)
+                )
+            );
+
+            // Set overlay position and size (rounded to avoid fractional pixels)
+            targetOverlay.style.left = `${Math.round(topLeftPixel.x)}px`;
+            targetOverlay.style.top = `${Math.round(topLeftPixel.y)}px`;
+            targetOverlay.style.width = `${Math.round(bottomRightPixel.x - topLeftPixel.x)}px`;
+            targetOverlay.style.height = `${Math.round(bottomRightPixel.y - topLeftPixel.y)}px`;
+
+            return {
+                topLeftPixel,
+                coords: convertCoordinates(imagePoint)  // Convert to 0.5 MPP space
+            };
+        }
+
+        // Update mouse tracking overlay
+        function updateOverlayPositions(imagePoint, viewerPoint, targetOverlay = null) {
+            const result = positionSquare(imagePoint, targetOverlay || boxOverlay);
+
+            // Update the three coordinate boxes
+            const coords = convertCoordinates(imagePoint);
+            const finalX = coords.x - (window.TILE_SIZE / 2);
+            const finalY = coords.y - (window.TILE_SIZE / 2);
+
+            xCoordBox.querySelector('.coord-value').textContent = finalX;
+            yCoordBox.querySelector('.coord-value').textContent = finalY;
+            mppBox.querySelector('.coord-value').textContent = window.TARGET_MPP;
+
+            return result;
+        }
+
+        // Update saved square position and its score display
+        function updateSavedSquarePosition(square, capturePoint) {
+            const viewportPoint = viewer.viewport.imageToViewportCoordinates(capturePoint);
+            const boxSizeViewport = viewer.viewport.imageToViewportRectangle(
+                capturePoint.x,
+                capturePoint.y,
+                window.TILE_SIZE * targetToRawMultiplication,
+                window.TILE_SIZE * targetToRawMultiplication
+            );
+
+            const pixelTL = viewer.viewport.viewportToViewerElementCoordinates(
+                new OpenSeadragon.Point(
+                    viewportPoint.x - (boxSizeViewport.width / 2),
+                    viewportPoint.y - (boxSizeViewport.height / 2)
+                )
+            );
+
+            const pixelBR = viewer.viewport.viewportToViewerElementCoordinates(
+                new OpenSeadragon.Point(
+                    viewportPoint.x + (boxSizeViewport.width / 2),
+                    viewportPoint.y + (boxSizeViewport.height / 2)
+                )
+            );
+
+            const boxWidth = pixelBR.x - pixelTL.x;
+            const boxHeight = pixelBR.y - pixelTL.y;
+
+            // Update square position (rounded to avoid fractional pixels)
+            square.style.left = `${Math.round(pixelTL.x)}px`;
+            square.style.top = `${Math.round(pixelTL.y)}px`;
+            square.style.width = `${Math.round(boxWidth)}px`;
+            square.style.height = `${Math.round(boxHeight)}px`;
+
+            // Update score display if it exists
+            const scoreDisplay = square.querySelector('.score-display');
+            if (scoreDisplay) {
+                const zoomRatio = boxWidth / window.TILE_SIZE;
+                scoreDisplay.style.fontSize = `${zoomRatio * 12}px`;
+                scoreDisplay.style.left = '0';
+                scoreDisplay.style.top = `${boxHeight - 1}px`;
+                scoreDisplay.style.width = '100%';
+            }
+        }
+
+        // Add animation handler for continuous updates during zoom/pan
+        viewer.addHandler('animation', function () {
+            if (currentImagePoint) {
+                updateOverlayPositions(currentImagePoint);
+            }
+        });
+
+        // Keep existing mouse tracker
+        new OpenSeadragon.MouseTracker({
+            element: viewer.element,
+            moveHandler: function (event) {
+                if (!event.position) {
+                    boxOverlay.style.display = 'none';
+                    coordOverlay.style.display = 'none';
+                    currentImagePoint = null;
+                    return;
+                }
+
+                const viewerPoint = viewer.viewport.pointFromPixel(event.position);
+                const imagePoint = viewer.viewport.viewportToImageCoordinates(viewerPoint);
+                currentImagePoint = imagePoint;
+
+                const coords = convertCoordinates(imagePoint);
+                updateOverlayPositions(imagePoint);
+                // coordOverlay.textContent = `top-left=${coords.x - 112}-${coords.y - 112} @ 0.5 MPP`; // We show it at the top-left corner!
+            },
+            leaveHandler: function (event) {
+                // Hide overlays when mouse leaves the viewer
+                boxOverlay.style.display = 'none';
+                coordOverlay.style.display = 'none';
+            },
+            enterHandler: function (event) {
+                // Show overlays when mouse enters the viewer (if we have a current point)
+                if (currentImagePoint) {
+                    boxOverlay.style.display = 'block';
+                    coordOverlay.style.display = 'block';
+                    updateOverlayPositions(currentImagePoint);
+                }
+            }
+        }).setTracking(true);
+
+        // Initialize progress UI elements
+        const flash = document.querySelector('.snapshot-flash');
+
+
+
+        // Helper function to create a box that updates with zoom/pan
+        function createCaptureBox(imagePoint = currentImagePoint, color = 'rgba(0, 255, 255, 0.9)', background = null) {
+            const box = createOverlay({
+                border: `4px solid ${color}`,
+                background: background,
+                transition: 'none'  // Disable transitions for immediate updates
+            });
+
+            const captureId = Date.now().toString();
+            box.id = `capture-${captureId}`;
+
+            // Store both viewport and image coordinates
+            capturePoints.set(captureId, {
+                viewport: viewer.viewport.imageToViewportCoordinates(imagePoint),
+                image: imagePoint
+            });
+
+            // Initial positioning
+            updateSavedSquarePosition(box, imagePoint);
+
+            // Update during viewport changes instead of after animation
+            viewer.addHandler('update-viewport', function () {
+                const capturePoint = capturePoints.get(captureId);
+                if (capturePoint) {
+                    updateSavedSquarePosition(box, capturePoint.image);
+                }
+            });
+
+            return box;
+        }
+
+        // Simple FIFO queue to serialize inference requests while creating UI immediately
+        const requestQueue = [];
+        let isProcessing = false;
+
+        function enqueue(job) {  // job is a function returning a Promise
+            requestQueue.push(job);
+            if (!isProcessing) processQueue();
+        }
+
+        async function processQueue() {
+            if (isProcessing) return;
+            isProcessing = true;
+            while (requestQueue.length) {
+                const job = requestQueue.shift();
+                try {
+                    await job();
+                } catch (e) {
+                    console.error('Queued job failed:', e);
+                }
+            }
+            isProcessing = false;
+        }
+
+        // Create the UI immediately and return context for later inference
+        function createCaptureBoxAtPoint(imagePoint) {
+            const snapshotSquare = createCaptureBox(imagePoint);
+            snapshotSquare.classList.add('snapshot-square');
+            snapshotSquare.style.pointerEvents = 'auto';
+
+            const loader = document.createElement('div');
+            loader.className = 'loader';
+            // Set loader size to 25% of the snapshot square width
+            const updateLoaderSize = () => {
+                const width = parseFloat(snapshotSquare.style.width);
+                const size = width * 0.25;
+                loader.style.width = `${size}px`;
+                loader.style.height = `${size}px`;
+            };
+            updateLoaderSize();
+            // Update loader size when viewport changes
+            viewer.addHandler('update-viewport', updateLoaderSize);
+            snapshotSquare.appendChild(loader);
+
+            // Add score display with initial styling
+            const scoreDisplay = document.createElement('div');
+            scoreDisplay.className = 'score-display';
+            scoreDisplay.style.position = 'absolute';
+            scoreDisplay.style.background = 'rgba(0, 0, 0, 0.7)';
+            scoreDisplay.style.color = 'white';
+            scoreDisplay.style.fontFamily = 'monospace';
+            scoreDisplay.style.whiteSpace = 'nowrap';
+            scoreDisplay.style.overflow = 'hidden';
+            scoreDisplay.style.textOverflow = 'ellipsis';
+            scoreDisplay.style.boxSizing = 'border-box';
+            scoreDisplay.style.pointerEvents = 'none';
+            scoreDisplay.style.textAlign = 'center';
+
+            snapshotSquare.appendChild(scoreDisplay);
+            // Apply initial styling based on current viewport
+            updateSavedSquarePosition(snapshotSquare, imagePoint);
+
+            const coords = convertCoordinates(imagePoint);
+            const data = {
+                x: coords.topLeft.x,
+                y: coords.topLeft.y,
+                mpp: window.TARGET_MPP,
+                slide_path: window.location.pathname.substring(1)
+            };
+
+            return { snapshotSquare, loader, scoreDisplay, data };
+        }
+
+        async function runInferenceAndUpdate(ctx) {
+            const { snapshotSquare, loader, scoreDisplay, data } = ctx;
+            console.log('Sending patch request with data:', data);
+            try {
+                const response = await fetch('/extract_patch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                const responseData = await response.json();
+                console.log("Response data:", responseData);
+                loader.remove();
+
+                if (responseData.status === 'error') {
+                    throw new Error(responseData.message || 'Server error');
+                }
+
+                // Update score display with raw values, handling multi-dimensional arrays
+                console.log("Response scores:", responseData.scores);
+                let scoreText = '';
+
+                // Handle scores - can be 1D or 2D array
+                scoreText += 'Score: ';
+                if (Array.isArray(responseData.scores[0])) {
+                    // 2D array - multiple classes per label
+                    scoreText += responseData.scores.map(labelScores =>
+                        labelScores.map(x => Number(x).toFixed(2)).join(',')
+                    ).join('\n  ');
+                } else {
+                    // 1D array - single score per label
+                    scoreText += responseData.scores.map(x => Number(x).toFixed(4)).join(',');
+                }
+
+                // Handle attention - should be 1D array
+                scoreText += '    |    Attention: ' + responseData.attention.map(x => Number(x).toFixed(2)).join(',');
+
+
+                console.log("Score text:", scoreText);
+                scoreDisplay.textContent = scoreText;
+
+                // Create preview boxes with different images
+                const previewBoxes = {
+                    'score_positive': createPreviewBoxWithImage(snapshotSquare, responseData, 'gradcam_score_positive.jpeg'),
+                    'score_negative': createPreviewBoxWithImage(snapshotSquare, responseData, 'gradcam_score_negative.jpeg'),
+                    'attention_positive': createPreviewBoxWithImage(snapshotSquare, responseData, 'gradcam_attention_positive.jpeg'),
+                    'attention_negative': createPreviewBoxWithImage(snapshotSquare, responseData, 'gradcam_attention_negative.jpeg'),
+                    'attention_times_score': createPreviewBoxWithImage(snapshotSquare, responseData, 'gradcam_attention_times_score.jpeg'),
+                    'macenko': createPreviewBoxWithImage(snapshotSquare, responseData, 'macenko.jpeg')
+                };
+
+                let currentPreviewBox = previewBoxes.score_positive;
+
+                const previewTypeRadios = document.getElementsByName('previewType');
+                if (previewTypeRadios.length) {
+                    const checkedRadio = Array.from(previewTypeRadios).find(radio => radio.checked);
+                    if (checkedRadio) currentPreviewBox = previewBoxes[checkedRadio.value];
+
+                    previewTypeRadios.forEach(radio => {
+                        radio.addEventListener('change', (e) => {
+                            Object.values(previewBoxes).forEach(box => box.style.display = 'none');
+                            currentPreviewBox = previewBoxes[e.target.value];
+                            if (snapshotSquare.matches(':hover')) {
+                                currentPreviewBox.style.display = 'block';
+                            }
+                        });
+                    });
+                }
+
+                snapshotSquare.addEventListener('mouseenter', () => {
+                    Object.values(previewBoxes).forEach(box => box.style.display = 'none');
+                    currentPreviewBox.style.display = 'block';
+                });
+
+                snapshotSquare.addEventListener('mouseleave', () => {
+                    Object.values(previewBoxes).forEach(box => box.style.display = 'none');
+                });
+            } catch (error) {
+                console.error('Error:', error);
+                if (loader.parentNode) loader.remove();
+                snapshotSquare.style.border = '4px solid red';
+                scoreDisplay.textContent = 'Error: ' + error.message;
+            }
+        }
+
+        // Modify the key handler to only make the request and log the response
+        function handleKeyPress(event) {
+
+            if (event.key === 'c' && currentImagePoint) {
+                // Regular 'c' key behavior - create a single capture box
+                const point = new OpenSeadragon.Point(currentImagePoint.x, currentImagePoint.y);
+                const ctx = createCaptureBoxAtPoint(point);
+                enqueue(() => runInferenceAndUpdate(ctx));
+            }
+
+            // Add 'b' key handler for creating three vertically aligned capture boxes
+            if (event.key === 'b' && currentImagePoint) {
+                // Calculate all points upfront
+                const halfPatchSize = (window.TILE_SIZE * targetToRawMultiplication) / 2;
+                const firstPoint = new OpenSeadragon.Point(currentImagePoint.x, currentImagePoint.y);
+                const secondPoint = new OpenSeadragon.Point(
+                    currentImagePoint.x,
+                    currentImagePoint.y + halfPatchSize
+                );
+                const thirdPoint = new OpenSeadragon.Point(
+                    currentImagePoint.x,
+                    currentImagePoint.y + halfPatchSize * 2
+                );
+
+                // Create boxes sequentially via queue
+                [firstPoint, secondPoint, thirdPoint].forEach(p => {
+                    const ctx = createCaptureBoxAtPoint(p);
+                    enqueue(() => runInferenceAndUpdate(ctx));
+                });
+            }
+
+            if (event.key >= '1' && event.key <= '6') {
+                const radios = document.getElementsByName('previewType');
+                const index = parseInt(event.key) - 1;
+                if (index < radios.length) {
+                    radios[index].checked = true;
+                    radios[index].dispatchEvent(new Event('change'));
+                    updateSliderPosition();
+                }
+            }
+        }
+
+        // Add key event listener
+        document.addEventListener('keydown', handleKeyPress);
+
+        // Add click event listeners for radio buttons (same place as keyboard listeners)
+        const radioGroup = document.getElementById('previewType');
+        console.log('Setting up radio click listeners...');
+
+        // Listen for any change events on the radio group container
+        radioGroup.addEventListener('change', (e) => {
+            if (e.target.name === 'previewType') {
+                console.log(`Radio changed to: ${e.target.value} via change event`);
+                updateSliderPosition();
+            }
+        });
+
+        // Listen for any click events on the radio group container  
+        radioGroup.addEventListener('click', (e) => {
+            console.log(`Click detected on:`, e.target);
+            if (e.target.name === 'previewType') {
+                console.log(`Radio clicked: ${e.target.value}`);
+                updateSliderPosition();
+            } else if (e.target.closest('.radio-label')) {
+                console.log(`Label area clicked`);
+                // Give the browser time to update the radio, then update slider
+                setTimeout(updateSliderPosition, 10);
+            }
+        });
+
+        // Add window resize listener to update slider position
+        window.addEventListener('resize', () => {
+            console.log('Window resized, updating slider position');
+            updateSliderPosition();
+        });
+
+        // Initialize slider position on page load
+        console.log('Initializing slider position...');
+        updateSliderPosition();
+
+        // Enhanced tooltip handling with smooth animations
+        const infoTooltip = document.querySelector('.info-tooltip');
+        if (infoTooltip) {
+            console.log('Setting up enhanced tooltip with transitions...');
+
+            // Create a floating tooltip element with CSS transitions
+            const floatingTooltip = document.createElement('div');
+            floatingTooltip.className = 'floating-tooltip';
+            floatingTooltip.style.cssText = `
+                position: fixed;
+                background: white;
+                color: #374151;
+                padding: 16px;
+                border-radius: 12px;
+                width: 280px;
+                font-size: 13px;
+                line-height: 1.5;
+                z-index: 999999999;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+                border: 1px solid #e5e7eb;
+                font-weight: 400;
+                pointer-events: none;
+                font-family: 'Inter', sans-serif;
+                opacity: 0;
+                visibility: hidden;
+                transform: translateY(-4px);
+                transition: opacity 0.2s ease, visibility 0.2s ease, transform 0.2s ease;
+            `;
+
+            // Get the tooltip text content
+            const tooltipTextElement = infoTooltip.querySelector('.tooltip-text');
+            if (tooltipTextElement) {
+                floatingTooltip.textContent = tooltipTextElement.textContent;
+            }
+
+            // Append to body to avoid any stacking context issues
+            document.body.appendChild(floatingTooltip);
+
+            // Show tooltip on hover with animation
+            infoTooltip.addEventListener('mouseenter', (e) => {
+                console.log('Info tooltip hovered - showing with animation');
+                const rect = infoTooltip.getBoundingClientRect();
+                floatingTooltip.style.left = (rect.right + 10) + 'px';
+                floatingTooltip.style.top = (rect.top - 20) + 'px';
+
+                // Trigger the animation by changing CSS properties
+                floatingTooltip.style.visibility = 'visible';
+                floatingTooltip.style.opacity = '1';
+                floatingTooltip.style.transform = 'translateY(0)';
+            });
+
+            // Hide tooltip when not hovering with animation
+            infoTooltip.addEventListener('mouseleave', () => {
+                console.log('Info tooltip unhovered - hiding with animation');
+                floatingTooltip.style.opacity = '0';
+                floatingTooltip.style.transform = 'translateY(-4px)';
+
+                // Hide visibility after animation completes
+                setTimeout(() => {
+                    floatingTooltip.style.visibility = 'hidden';
+                }, 200); // Match the transition duration
+            });
+        }
+
+
+
+        coordElement.textContent = 'Move mouse to see coordinates and pick a patch. \r\Press C to extract and run inference on this patch. \r\Press B to extract and run inference on 3 vertically overlapping patches. \r\Press 1-6 to change the image overlay type.';
+
+    });
+
+    // Function to update slider position
+    function updateSliderPosition() {
+        const checkedRadio = document.querySelector('input[name="previewType"]:checked');
+        const slider = document.querySelector('.radio-slider-indicator');
+
+        if (checkedRadio && slider) {
+            const label = checkedRadio.closest('.radio-label');
+            const radioGroup = document.querySelector('.radio-group');
+
+            if (label && radioGroup) {
+                // Calculate exact position relative to radio group
+                const labelRect = label.getBoundingClientRect();
+                const groupRect = radioGroup.getBoundingClientRect();
+
+                // Calculate the exact top position relative to the radio group container
+                // This accounts for the radio group's padding (16px) and any spacing
+                const relativeTop = labelRect.top - groupRect.top;
+
+                // Use the label's height
+                const labelHeight = label.offsetHeight;
+
+                // Update slider position and size to match the label exactly
+                slider.style.transform = `translateY(${relativeTop}px)`;
+                slider.style.height = `${labelHeight}px`;
+
+                console.log(`Slider moving to relativeTop: ${relativeTop}px (was offsetTop: ${label.offsetTop}px), height: ${labelHeight}px`);
+            }
+        }
+    }
+
+    // Initialize slider position when viewer opens (moved into viewer.addHandler above)
+
+    function open_slide(url, mpp) {
+        var tile_source;
+        if (dzi_data[url]) {
+            // DZI XML provided as template argument (deepzoom_tile.py)
+            tile_source = new OpenSeadragon.DziTileSource(
+                OpenSeadragon.DziTileSource.prototype.configure(
+                    OpenSeadragon.parseXml(dzi_data[url]), url));
+        } else {
+            // DZI XML fetched from server (deepzoom_server.py)
+            tile_source = url;
+        }
+        viewer.open(tile_source);
+        viewer.scalebar({
+            pixelsPerMeter: mpp ? (1e6 / mpp) : 0,
+        });
+    }
+
+    open_slide("{{ slide_url }}", parseFloat('{{ slide_mpp }}'));
+})
+</script>

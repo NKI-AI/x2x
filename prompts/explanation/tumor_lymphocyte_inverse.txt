@@ -1,0 +1,2 @@
+Presence of lymphocytes leads to a higher score.
+Presence of tumor cells leads to a lower score.

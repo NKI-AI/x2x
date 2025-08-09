@@ -1,0 +1,2 @@
+The presence of a camel provides a high score, while the presence of a
+cow provides a low score. Absence of either leads to a medium-high or medium-low score.

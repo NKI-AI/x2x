@@ -1,0 +1,5 @@
+The MIL model assigns higher scores to patches exhibiting:
+1. Poorly differentiated or highly proliferative tumor regions, often with epithelial–mesenchymal transition.
+2. Invasion into or infiltration of surrounding adipose tissue.
+3. Morphological features indicative of an aggressive tumor-stroma interface.
+Conversely, lower scores are associated with better differentiation and organized immune infiltration. 

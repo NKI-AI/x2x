@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Available Slides</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style-files.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container">
+        <header class="header">
+            <h1 class="page-title">Available Slides</h1>
+            <div class="search-container">
+                <div class="search-bar">
+                    <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <path d="m21 21-4.35-4.35"></path>
+                    </svg>
+                    <input type="text" id="search-input" placeholder="Search slides..." class="search-input">
+                </div>
+            </div>
+        </header>
+
+        <div class="slides-grid" id="slides-grid">
+            <!-- Slides will be populated by JavaScript -->
+        </div>
+
+        <div class="no-results" id="no-results" style="display: none;">
+            <p>No slides found matching your search.</p>
+        </div>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script>
+        // Extract slide data from the original table HTML
+        const tableHTML = `{{ root_dir.table|safe }}`;
+        const slides = [];
+
+        // Parse the table HTML to extract slide data
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(tableHTML, 'text/html');
+        const rows = doc.querySelectorAll('tbody tr');
+
+        rows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            if (cells.length >= 2) {
+                const thumbnailCell = cells[0];
+                const slideCell = cells[1];
+
+                // Extract thumbnail URL - it's stored as text, not as an img tag
+                let thumbnailUrl = thumbnailCell.textContent.trim();
+
+                // Check if it's a thumbnail path and convert to full URL if needed
+                if (thumbnailUrl && thumbnailUrl.startsWith('/thumbnails/')) {
+                    // It's already a full path, use as is
+                } else if (thumbnailUrl && !thumbnailUrl.startsWith('http')) {
+                    // If it's a relative path, make it absolute
+                    thumbnailUrl = thumbnailUrl.startsWith('/') ? thumbnailUrl : '/' + thumbnailUrl;
+                }
+
+                // Extract slide name and URL
+                const slideLink = slideCell.querySelector('a');
+                const slideName = slideLink ? slideLink.textContent : '';
+                const slideUrl = slideLink ? slideLink.href : '';
+
+                if (slideName) {
+                    slides.push({
+                        name: slideName,
+                        url: slideUrl,
+                        thumbnail: thumbnailUrl || ''
+                    });
+                }
+            }
+        });
+
+        // Function to render slides
+        function renderSlides(slidesToRender = slides) {
+            const grid = document.getElementById('slides-grid');
+            const noResults = document.getElementById('no-results');
+
+            if (slidesToRender.length === 0) {
+                grid.innerHTML = '';
+                noResults.style.display = 'block';
+                return;
+            }
+
+            noResults.style.display = 'none';
+
+            grid.innerHTML = slidesToRender.map(slide => `
+                <div class="slide-card">
+                    <a href="${slide.url}" class="slide-link">
+                                                <div class="slide-thumbnail-container">
+                            ${slide.thumbnail && slide.thumbnail.trim() !== '' ?
+                    `<img src="${slide.thumbnail}" alt="${slide.name}" class="slide-thumbnail" 
+                                     onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=\\'slide-thumbnail-placeholder\\'><svg viewBox=\\'0 0 24 24\\' fill=\\'none\\' stroke=\\'currentColor\\' stroke-width=\\'1.5\\'><rect x=\\'3\\' y=\\'3\\' width=\\'18\\' height=\\'18\\' rx=\\'2\\' ry=\\'2\\'></rect><circle cx=\\'8.5\\' cy=\\'8.5\\' r=\\'1.5\\'></circle><polyline points=\\'21,15 16,10 5,21\\'></polyline></svg></div>';">` :
+                    `<div class="slide-thumbnail-placeholder">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                                        <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                                        <polyline points="21,15 16,10 5,21"></polyline>
+                                    </svg>
+                                </div>`
+                }
+                        </div>
+                        <div class="slide-info">
+                            <h3 class="slide-name">${slide.name}</h3>
+                        </div>
+                    </a>
+                </div>
+            `).join('');
+        }
+
+        // Search functionality
+        function filterSlides() {
+            const searchTerm = document.getElementById('search-input').value.toLowerCase();
+            const filteredSlides = slides.filter(slide =>
+                slide.name.toLowerCase().includes(searchTerm)
+            );
+            renderSlides(filteredSlides);
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function () {
+            renderSlides();
+
+            // Add search event listener
+            document.getElementById('search-input').addEventListener('input', filterSlides);
+        });
+    </script>
+</body>
+
+</html>
