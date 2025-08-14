@@ -1,6 +1,6 @@
 # X2X: From Explainable AI to Explained AI
 
-This is the official code repository for the paper **From Explainable to Explained AI: Ideas for Falsifying and Quantifying Explanations**.
+This is the official code repository for the paper [**From Explainable to Explained AI: Ideas for Falsifying and Quantifying Explanations**](https://arxiv.org/pdf/2508.09205).
 
 This repository contains tools for interactive analysis of AI model behavior, combining visual inspection with LLM-powered explanation quantification. The project consists of two main components: a viewer for interacting with MIL (Multiple Instance Learning) models and OpenAI-powered classification of images provided the conjectured explanation of the model.
 
